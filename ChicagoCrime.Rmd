@@ -1,0 +1,215 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Investigating arrest disparities across Chicago's police districts and community areas
+
+
+```{r Libraries}
+library(readr)
+library(dplyr)
+library(lubridate)
+```
+
+
+```{r}
+crime <- read.csv("Crimes_-_2001_to_Present_20260613.csv")
+names(crime)
+
+crime_df <- crime %>% 
+  filter(Year >= 2015, Year <= 2025) %>%
+  select(
+    id          = ID,
+    arrest      = Arrest,,
+    domestic    = Domestic,
+    district    = District,
+    primary_type = Primary.Type,
+    community_area = Community.Area,
+    date       = Date) %>% 
+  filter(!is.na(arrest), !is.na(primary_type), 
+       !is.na(community_area), !is.na(district)) %>%
+  mutate(
+    # Convert to binary
+    Arrest = as.numeric(arrest),
+    Domestic = as.numeric(domestic),
+    
+    # Create crime categories
+    Crime_Category = case_when(
+      primary_type %in% c("HOMICIDE", "ASSAULT", "BATTERY", "ROBBERY", 
+                          "SEX OFFENSE", "CRIMINAL SEXUAL ASSAULT", "KIDNAPPING") 
+        ~ "Violent",
+      primary_type %in% c("THEFT", "BURGLARY", "MOTOR VEHICLE THEFT", 
+                          "CRIMINAL DAMAGE", "ARSON")
+        ~ "Property",
+      Primary.Type %in% c("NARCOTICS", "WEAPONS VIOLATION", "LIQUOR LAW VIOLATION",
+                          "PROSTITUTION", "GAMBLING")
+        ~ "Vice/Drugs",
+      TRUE ~ "Other"),
+    # Parse date/time
+    DateTime = mdy_hms(Date),
+    Hour = hour(DateTime),
+    Time_of_Day = case_when(
+      Hour %in% c(6:11) ~ "Morning",
+      Hour %in% c(12:17) ~ "Afternoon",
+      Hour %in% c(18:23) ~ "Evening",
+      TRUE ~ "Night")) %>%
+  select(-Date, -DateTime)  # Drop originals
+
+# Check
+head(crime_clean)
+dim(crime_clean)
+table(crime_clean$Crime_Category)
+table(crime_clean$Arrest)
+
+```
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+crime_clean <- crime %>%
+  filter(Year >= 2015, Year <= 2025) %>%
+  select(ID, Arrest, Primary.Type, Domestic, Community.Area, District, Date) %>%
+  mutate(
+    # Convert character "true"/"false" to numeric 1/0
+    Arrest = ifelse(Arrest == "true", 1, 0),
+    Domestic = ifelse(Domestic == "true", 1, 0)
+  ) %>%
+  filter(!is.na(Primary.Type), 
+         !is.na(Community.Area), 
+         !is.na(District)) %>%
+  mutate(
+    Crime_Category = case_when(
+      Primary.Type %in% c("HOMICIDE", "ASSAULT", "BATTERY", "ROBBERY", 
+                          "SEX OFFENSE", "CRIMINAL SEXUAL ASSAULT", "KIDNAPPING") 
+        ~ "Violent",
+      Primary.Type %in% c("THEFT", "BURGLARY", "MOTOR VEHICLE THEFT", 
+                          "CRIMINAL DAMAGE", "ARSON")
+        ~ "Property",
+      Primary.Type %in% c("NARCOTICS", "WEAPONS VIOLATION", "LIQUOR LAW VIOLATION",
+                          "PROSTITUTION", "GAMBLING")
+        ~ "Vice/Drugs",
+      TRUE ~ "Other"
+    ),
+    DateTime = mdy_hms(Date),
+    Hour = hour(DateTime),
+    Time_of_Day = case_when(
+      Hour %in% c(6, 7, 8, 9, 10, 11) ~ "Morning",
+      Hour %in% c(12, 13, 14, 15, 16, 17) ~ "Afternoon",
+      Hour %in% c(18, 19, 20, 21, 22, 23) ~ "Evening",
+      Hour %in% c(0, 1, 2, 3, 4, 5) ~ "Night"
+    )
+  ) %>%
+  select(-Date, -DateTime)
+
+# Verify
+head(crime_clean)
+dim(crime_clean)
+table(crime_clean$Arrest)
+table(crime_clean$Domestic)
+table(crime_clean$Crime_Category)
+
+```
+
+```{r}
+# Check what's in Arrest column
+table(crime$Arrest, useNA = "always")  # See all unique values including NA
+class(crime$Arrest)  # Check data type
+
+# Check for unexpected values
+unique(crime$Arrest)
+
+# Check how many NAs were introduced
+sum(is.na(crime$Arrest))
+```
+
+```{r}
+library(lme4)
+
+# Quick check: How many districts and community areas?
+n_districts <- n_distinct(crime_clean$District)
+n_areas <- n_distinct(crime_clean$Community.Area)
+cat("Districts:", n_districts, "\n")
+cat("Community Areas:", n_areas, "\n")
+
+# ============================================
+# MODEL 0: Empty Model (to calculate ICC)
+# ============================================
+m0 <- glmer(Arrest ~ 1 + (1 | Community.Area / District),
+            family = binomial(link = "logit"),
+            data = crime_clean,
+            control = glmerControl(optimizer = "bobyqa"))
+
+summary(m0)
+
+# Extract ICC (intraclass correlation)
+# ICC tells you: what proportion of variance is between districts/areas vs within?
+
+# ============================================
+# MODEL 1: Add Crime Type & Domestic
+# ============================================
+m1 <- glmer(Arrest ~ Crime_Category + Domestic + (1 | Community.Area / District),
+            family = binomial(link = "logit"),
+            data = crime_clean,
+            control = glmerControl(optimizer = "bobyqa"))
+
+summary(m1)
+
+# ============================================
+# MODEL 2: Add Time of Day
+# ============================================
+m2 <- glmer(Arrest ~ Crime_Category + Domestic + Time_of_Day + 
+              (1 | Community.Area / District),
+            family = binomial(link = "logit"),
+            data = crime_clean,
+            control = glmerControl(optimizer = "bobyqa"))
+
+summary(m2)
+
+# ============================================
+# MODEL 3: Random Slope (Crime Type varies by District)
+# ============================================
+# This is your "sophisticated" model for Sessions 2-3
+m3 <- glmer(Arrest ~ Crime_Category + Domestic + Time_of_Day + 
+              (1 | Community.Area) + 
+              (1 + Crime_Category | District),
+            family = binomial(link = "logit"),
+            data = crime_clean,
+            control = glmerControl(optimizer = "bobyqa", 
+                                   optCtrl = list(maxfun = 2e5)))
+
+summary(m3)
+
+# ============================================
+# COMPARE MODELS
+# ============================================
+anova(m0, m1, m2, m3)
+```
+
+
+```{r}
+# ICC from empty model
+icc_function <- function(model) {
+  var_intercept <- as.numeric(VarCorr(model)[[1]])
+  var_residual <- sigma(model)^2
+  return(var_intercept / (var_intercept + var_residual))
+}
+
+# Get fixed effects (odds ratios)
+fixef_m3 <- fixef(m3)
+odds_ratios <- exp(fixef_m3)
+print(odds_ratios)
+
+# Get random effects
+ranef_m3 <- ranef(m3)
+head(ranef_m3$District)  # Show district random intercepts
+head(ranef_m3$Community.Area)  # Show community area random intercepts
+
+# Model comparison
+model_comparison <- anova(m0, m1, m2, m3)
+print(model_comparison)
+```
+
+
+
+
